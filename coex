@@ -1,0 +1,105 @@
+import rospy
+import cv2
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from clover import long_callback
+from clover import srv
+from std_srvs.srv import Trigger
+import math
+import numpy as np
+from clover.srv import SetLEDEffect
+rospy.init_node('flight')
+
+get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+navigate_global = rospy.ServiceProxy('navigate_global', srv.NavigateGlobal)
+set_position = rospy.ServiceProxy('set_position', srv.SetPosition)
+set_velocity = rospy.ServiceProxy('set_velocity', srv.SetVelocity)
+set_attitude = rospy.ServiceProxy('set_attitude', srv.SetAttitude)
+set_rates = rospy.ServiceProxy('set_rates', srv.SetRates)
+land = rospy.ServiceProxy('land', Trigger)
+image_pub = rospy.Publisher('~debug', Image)
+rospy.init_node('cv')
+bridge = CvBridge()
+object_id = 0  
+aruco_ids = [66, 70, 74, 78, 82, 86, 90, 94, 95, 91, 87, 83, 79, 75, 71, 67]
+current_aruco_index = 0  #
+color_ranges = {
+    'red': [(0, 100, 100), (10, 255, 255)],  # Red color range
+    'green': [(50, 100, 100), (70, 255, 255)],  # Green color range
+    'pink': [(140, 100, 100), (170, 255, 255)]  # Pink color range
+}
+
+
+        
+def write_color_to_file(color, x, y):
+    global object_id
+    object_id += 1
+    with open("/detected_colors.txt", "a") as file:  
+        file.write(f"object {object_id}: {color} {x} {y},\n")
+
+def find_color(image, color_lower, color_upper):
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, color_range[0], color_range[1])
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            return cx, cy, True
+    return 0, 0, False
+
+def navigate_wait(x=0, y=0, z=0, yaw=float('nan'), speed=0.5, frame_id='', auto_arm=False, tolerance=0.2): #Функция для полета в точку и ожидание окончания полета
+    navigate(x=x, y=y, z=z, yaw=yaw, speed=speed, frame_id=frame_id, auto_arm=auto_arm)
+
+    while not rospy.is_shutdown():
+        telem = get_telemetry(frame_id='navigate_target')
+        if math.sqrt(telem.x  2 + telem.y  2 + telem.z ** 2) < tolerance:
+            break
+        rospy.sleep(0.2)
+
+def land_wait(): 
+    land()
+    while get_telemetry().armed:
+        rospy.sleep(0.2)
+
+def follow_aruco_path():
+    global current_aruco_index
+    if current_aruco_index < len(aruco_ids):
+        navigate_wait(frame_id='body', x=0, y=0, z=2, speed=0.5, auto_arm=True)
+        marker_id = aruco_ids[current_aruco_index]
+        print(f"Навигация к маркеру {marker_id}")
+        navigate_wait(frame_id=f'aruco_{marker_id}', x=0, y=0, z=2)
+        current_aruco_index += 1
+    else:
+        print("Путь по меткам завершен.")
+        land_wait()
+
+@long_callback
+def image_callback(data):
+    global current_aruco_index
+    try:
+        img = bridge.imgmsg_to_cv2(data, 'bgr8')
+
+        for color, range in color_ranges.items():
+            cx, cy, found = find_color(img, range)
+            if found:
+                print(f"Обнаружен цвет {color} на позиции ({cx}, {cy})")
+                write_color_to_file(color, cx, cy)
+                navigate_wait(frame_id='aruco_map', x=cx, y=cy, z=0) 
+                if color == "red":
+                    set_effect(effect='flash', r=255, g=0, b=0) 
+                rospy.sleep(5)  
+                print("Возвращение к следованию по меткам")
+                follow_aruco_path()  
+
+    except CvBridgeError as e:
+        print(e)
+
+image_sub = rospy.Subscriber('main_camera/image_raw', Image, image_callback)
+
+follow_aruco_path()
+rospy.spin()
